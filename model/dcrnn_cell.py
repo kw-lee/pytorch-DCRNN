@@ -77,7 +77,8 @@ class DCGRUCell(BaseModel):
     Graph Convolution Gated Recurrent Unit Cell.
     """
     def __init__(self, input_dim, num_units, adj_mat, max_diffusion_step, num_nodes,
-                 num_proj=None, activation=torch.tanh, use_gc_for_ru=True, filter_type='laplacian'):
+                 num_proj=None, activation=torch.tanh, use_gc_for_ru=True, filter_type='laplacian',
+                 cuda=True):
         """
         :param num_units: the hidden dim of rnn
         :param adj_mat: the (weighted) adjacency matrix of the graph, in numpy ndarray form
@@ -106,7 +107,10 @@ class DCGRUCell(BaseModel):
         else:
             supports.append(utils.calculate_scaled_laplacian(adj_mat))
         for support in supports:
-            self._supports.append(self._build_sparse_matrix(support).cuda())  # to PyTorch sparse tensor
+            if cuda:
+                self._supports.append(self._build_sparse_matrix(support).cuda())  # to PyTorch sparse tensor
+            else:
+                self._supports.append(self._build_sparse_matrix(support))
         # supports = utils.calculate_scaled_laplacian(adj_mat, lambda_max=None)  # scipy coo matrix
         # self._supports = self._build_sparse_matrix(supports).cuda()  # to pytorch sparse tensor
 

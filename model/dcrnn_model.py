@@ -11,7 +11,7 @@ from base import BaseModel
 
 class DCRNNEncoder(BaseModel):
     def __init__(self, input_dim, adj_mat, max_diffusion_step, hid_dim, num_nodes,
-                 num_rnn_layers, filter_type):
+                 num_rnn_layers, filter_type, cuda=True):
         super(DCRNNEncoder, self).__init__()
         self.hid_dim = hid_dim
         self._num_rnn_layers = num_rnn_layers
@@ -21,16 +21,18 @@ class DCRNNEncoder(BaseModel):
         # the first layer has different input_dim
         encoding_cells.append(DCGRUCell(input_dim=input_dim, num_units=hid_dim, adj_mat=adj_mat,
                                         max_diffusion_step=max_diffusion_step,
-                                        num_nodes=num_nodes, filter_type=filter_type))
+                                        num_nodes=num_nodes, filter_type=filter_type,
+                                        cuda=cuda))
 
         # construct multi-layer rnn
         for _ in range(1, num_rnn_layers):
             encoding_cells.append(DCGRUCell(input_dim=hid_dim, num_units=hid_dim, adj_mat=adj_mat,
                                             max_diffusion_step=max_diffusion_step,
-                                            num_nodes=num_nodes, filter_type=filter_type))
+                                            num_nodes=num_nodes, filter_type=filter_type,
+                                            cuda=cuda))
         self.encoding_cells = nn.ModuleList(encoding_cells)
 
-    def forward(self, inputs, initial_hidden_state):
+    def forward(self, inputs, initial_hidden_state, cuda=True):
         # inputs shape is (seq_length, batch, num_nodes, input_dim) (12, 64, 207, 2)
         # inputs to cell is (batch, num_nodes * input_dim)
         # init_hidden_state should be (num_layers, batch_size, num_nodes*num_units) (2, 64, 207*64)
@@ -47,7 +49,10 @@ class DCRNNEncoder(BaseModel):
                 _, hidden_state = self.encoding_cells[i_layer](current_inputs[t, ...], hidden_state)  # (50, 207*64)
                 output_inner.append(hidden_state)
             output_hidden.append(hidden_state)
-            current_inputs = torch.stack(output_inner, dim=0).cuda()  # seq_len, B, ...
+            if cuda:
+                current_inputs = torch.stack(output_inner, dim=0).cuda()  # seq_len, B, ...
+            else:
+                current_inputs = torch.stack(output_inner, dim=0)
         # output_hidden: the hidden state of each layer at last time step, shape (num_layers, batch, outdim)
         # current_inputs: the hidden state of the top layer (seq_len, B, outdim)
         return output_hidden, current_inputs
@@ -62,7 +67,7 @@ class DCRNNEncoder(BaseModel):
 
 class DCGRUDecoder(BaseModel):
     def __init__(self, input_dim, adj_mat, max_diffusion_step, num_nodes,
-                 hid_dim, output_dim, num_rnn_layers, filter_type):
+                 hid_dim, output_dim, num_rnn_layers, filter_type, cuda=True):
         super(DCGRUDecoder, self).__init__()
         self.hid_dim = hid_dim
         self._num_nodes = num_nodes  # 207
@@ -71,16 +76,19 @@ class DCGRUDecoder(BaseModel):
 
         cell = DCGRUCell(input_dim=hid_dim, num_units=hid_dim,
                          adj_mat=adj_mat, max_diffusion_step=max_diffusion_step,
-                         num_nodes=num_nodes, filter_type=filter_type)
+                         num_nodes=num_nodes, filter_type=filter_type,
+                         cuda=cuda)
         cell_with_projection = DCGRUCell(input_dim=hid_dim, num_units=hid_dim,
                                          adj_mat=adj_mat, max_diffusion_step=max_diffusion_step,
-                                         num_nodes=num_nodes, num_proj=output_dim, filter_type=filter_type)
+                                         num_nodes=num_nodes, num_proj=output_dim, filter_type=filter_type,
+                                         cuda=cuda)
 
         decoding_cells = list()
         # first layer of the decoder
         decoding_cells.append(DCGRUCell(input_dim=input_dim, num_units=hid_dim,
                                         adj_mat=adj_mat, max_diffusion_step=max_diffusion_step,
-                                        num_nodes=num_nodes, filter_type=filter_type))
+                                        num_nodes=num_nodes, filter_type=filter_type,
+                                        cuda=cuda))
         # construct multi-layer rnn
         for _ in range(1, num_rnn_layers - 1):
             decoding_cells.append(cell)
@@ -133,7 +141,7 @@ class DCGRUDecoder(BaseModel):
 
 class DCRNNModel(BaseModel):
     def __init__(self, adj_mat, batch_size, enc_input_dim, dec_input_dim, max_diffusion_step, num_nodes,
-                 num_rnn_layers, rnn_units, seq_len, output_dim, filter_type):
+                 num_rnn_layers, rnn_units, seq_len, output_dim, filter_type, cuda=True):
         super(DCRNNModel, self).__init__()
         # scaler for data normalization
         # self._scaler = scaler
@@ -147,34 +155,44 @@ class DCRNNModel(BaseModel):
         # use_curriculum_learning = bool(model_kwargs.get('use_curriculum_learning', False))  # should be true
         self._output_dim = output_dim  # should be 1
 
+        self.cuda = cuda
+
         # specify a GO symbol as the start of the decoder
-        self.GO_Symbol = torch.zeros(1, batch_size, num_nodes * self._output_dim, 1).cuda()
+        if self.cuda:
+            self.GO_Symbol = torch.zeros(1, batch_size, num_nodes * self._output_dim, 1).cuda()
+        else:
+            self.GO_Symbol = torch.zeros(1, batch_size, num_nodes * self._output_dim, 1)
 
         self.encoder = DCRNNEncoder(input_dim=enc_input_dim, adj_mat=adj_mat,
                                     max_diffusion_step=max_diffusion_step,
                                     hid_dim=rnn_units, num_nodes=num_nodes,
-                                    num_rnn_layers=num_rnn_layers, filter_type=filter_type)
+                                    num_rnn_layers=num_rnn_layers, filter_type=filter_type,
+                                    cuda=self.cuda)
         self.decoder = DCGRUDecoder(input_dim=dec_input_dim,
                                     adj_mat=adj_mat, max_diffusion_step=max_diffusion_step,
                                     num_nodes=num_nodes, hid_dim=rnn_units,
                                     output_dim=self._output_dim,
-                                    num_rnn_layers=num_rnn_layers, filter_type=filter_type)
+                                    num_rnn_layers=num_rnn_layers, filter_type=filter_type,
+                                    cuda=self.cuda)
         assert self.encoder.hid_dim == self.decoder.hid_dim, \
             "Hidden dimensions of encoder and decoder must be equal!"
 
-    def forward(self, source, target, teacher_forcing_ratio):
+    def forward(self, source, target, teacher_forcing_ratio, cuda=True):
         # the size of source/target would be (64, 12, 207, 2)
         source = torch.transpose(source, dim0=0, dim1=1)
         target = torch.transpose(target[..., :self._output_dim], dim0=0, dim1=1)
         target = torch.cat([self.GO_Symbol, target], dim=0)
 
         # initialize the hidden state of the encoder
-        init_hidden_state = self.encoder.init_hidden(self._batch_size).cuda()
+        if cuda:
+            init_hidden_state = self.encoder.init_hidden(self._batch_size).cuda()
+        else:
+            init_hidden_state = self.encoder.init_hidden(self._batch_size)
 
         # last hidden state of the encoder is the context
-        context, _ = self.encoder(source, init_hidden_state)  # (num_layers, batch, outdim)
+        context, _ = self.encoder(source, init_hidden_state, cuda=cuda)  # (num_layers, batch, outdim)
 
-        outputs = self.decoder(target, context, teacher_forcing_ratio=teacher_forcing_ratio)
+        outputs = self.decoder(target, context, teacher_forcing_ratio=teacher_forcing_ratio, cuda=cuda)
         # the elements of the first time step of the outputs are all zeros.
         return outputs[1:, :, :]  # (seq_length, batch_size, num_nodes*output_dim)  (12, 64, 207*1)
 
