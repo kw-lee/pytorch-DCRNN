@@ -2,22 +2,19 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
-
-from lib import utils
 import torch
 import torch.nn as nn
 from base import BaseModel
 
 
 class DiffusionGraphConv(BaseModel):
-    def __init__(self, supports, input_dim, hid_dim, num_nodes, max_diffusion_step, output_dim, bias_start=0.0):
-        super(DiffusionGraphConv, self).__init__()
+    def __init__(self, input_dim, hid_dim, num_nodes, max_diffusion_step, output_dim, supports=None, adj_mat=None, filter_type=None, bias_start=0.0):
+        super(DiffusionGraphConv, self).__init__(supports=supports, adj_mat=adj_mat, filter_type=filter_type)
+        # NUM_MATRICES: ORDER
         self.num_matrices = len(supports) * max_diffusion_step + 1  # Don't forget to add for x itself.
         input_size = input_dim + hid_dim
         self._num_nodes = num_nodes
         self._max_diffusion_step = max_diffusion_step
-        self._supports = supports
         self.weight = nn.Parameter(torch.FloatTensor(size=(input_size*self.num_matrices, output_dim)))
         self.biases = nn.Parameter(torch.FloatTensor(size=(output_dim,)))
         nn.init.xavier_normal_(self.weight.data, gain=1.414)
@@ -28,10 +25,10 @@ class DiffusionGraphConv(BaseModel):
         x_ = torch.unsqueeze(x_, 0)
         return torch.cat([x, x_], dim=0)
 
-    def forward(self, inputs, state, output_size, bias_start=0.0):
+    def forward(self, inputs, state, output_size):
         """
         Diffusion Graph convolution with graph matrix
-        :param inputs:
+        :param inputs: (time_dim, batch_size, num_nodes, input_dim)
         :param state:
         :param output_size:
         :param bias_start:
@@ -41,8 +38,9 @@ class DiffusionGraphConv(BaseModel):
         batch_size = inputs.shape[0]
         inputs = torch.reshape(inputs, (batch_size, self._num_nodes, -1))
         state = torch.reshape(state, (batch_size, self._num_nodes, -1))
-        inputs_and_state = torch.cat([inputs, state], dim=2)
+        inputs_and_state = torch.cat([inputs, state], dim=2) # (batch_size, num_nodes, input_DIM + hidden_dim)
         input_size = inputs_and_state.shape[2]
+        
         # dtype = inputs.dtype
 
         x = inputs_and_state
@@ -64,7 +62,9 @@ class DiffusionGraphConv(BaseModel):
 
         x = torch.reshape(x, shape=[self.num_matrices, self._num_nodes, input_size, batch_size])
         x = torch.transpose(x, dim0=0, dim1=3)  # (batch_size, num_nodes, input_size, order)
+   
         x = torch.reshape(x, shape=[batch_size * self._num_nodes, input_size * self.num_matrices])
+
 
         x = torch.matmul(x, self.weight)  # (batch_size * self._num_nodes, output_size)
         x = torch.add(x, self.biases)
@@ -82,8 +82,9 @@ class DCGRUCell(BaseModel):
     """
     Graph Convolution Gated Recurrent Unit Cell.
     """
-    def __init__(self, input_dim, num_units, adj_mat, max_diffusion_step, num_nodes,
-                 num_proj=None, activation=torch.tanh, use_gc_for_ru=True, filter_type='laplacian'):
+    def __init__(self, input_dim, num_units, max_diffusion_step, num_nodes,
+                 num_proj=None, activation=torch.tanh, use_gc_for_ru=True,  
+                 supports=None, adj_mat=None, filter_type=None):
         """
         :param num_units: the hidden dim of rnn
         :param adj_mat: the (weighted) adjacency matrix of the graph, in numpy ndarray form
@@ -93,40 +94,30 @@ class DCGRUCell(BaseModel):
         :param activation: if None, don't do activation for cell state
         :param use_gc_for_ru: decide whether to use graph convolution inside rnn
         """
-        super(DCGRUCell, self).__init__()
+        super(DCGRUCell, self).__init__(supports=supports,
+                                        adj_mat=adj_mat,
+                                        filter_type=filter_type)
         self._activation = activation
         self._num_nodes = num_nodes
         self._num_units = num_units
         self._max_diffusion_step = max_diffusion_step
         self._num_proj = num_proj
         self._use_gc_for_ru = use_gc_for_ru
-        self._supports = []
-        supports = []
-        if filter_type == "laplacian":
-            supports.append(utils.calculate_scaled_laplacian(adj_mat, lambda_max=None))
-        elif filter_type == "random_walk":
-            supports.append(utils.calculate_random_walk_matrix(adj_mat).T)
-        elif filter_type == "dual_random_walk":
-            supports.append(utils.calculate_random_walk_matrix(adj_mat))
-            supports.append(utils.calculate_random_walk_matrix(adj_mat.T))
-        else:
-            supports.append(utils.calculate_scaled_laplacian(adj_mat))
-        for support in supports:
-            self._supports.append(self._build_sparse_matrix(support))
+
         # supports = utils.calculate_scaled_laplacian(adj_mat, lambda_max=None)  # scipy coo matrix
         # self._supports = self._build_sparse_matrix(supports).cuda()  # to pytorch sparse tensor
-        self._supports = torch.Parameter(torch.stack(self._supports))
-        self._supports.requires_grad = False
 
         self.dconv_gate = DiffusionGraphConv(supports=self._supports, input_dim=input_dim,
                                              hid_dim=num_units, num_nodes=num_nodes,
                                              max_diffusion_step=max_diffusion_step,
-                                             output_dim=num_units*2)
+                                             output_dim=num_units*2,
+                                             bias_start=1.0)
         self.dconv_candidate = DiffusionGraphConv(supports=self._supports, 
                                                   input_dim=input_dim,
                                                   hid_dim=num_units, num_nodes=num_nodes,
                                                   max_diffusion_step=max_diffusion_step,
-                                                  output_dim=num_units)
+                                                  output_dim=num_units,
+                                                  bias_start=1.0)
         if num_proj is not None:
             self.project = nn.Linear(self._num_units, self._num_proj)
 
@@ -149,7 +140,8 @@ class DCGRUCell(BaseModel):
             fn = self.dconv_gate
         else:
             fn = self._fc
-        value = torch.sigmoid(fn(inputs, state, output_size, bias_start=1.0))
+            
+        value = torch.sigmoid(fn(inputs, state, output_size))
         value = torch.reshape(value, (-1, self._num_nodes, output_size))
         r, u = torch.split(value, split_size_or_sections=int(output_size/2), dim=-1)
         r = torch.reshape(r, (-1, self._num_nodes * self._num_units))
@@ -169,18 +161,6 @@ class DCGRUCell(BaseModel):
     def _concat(x, x_):
         x_ = torch.unsqueeze(x_, 0)
         return torch.cat([x, x_], dim=0)
-
-    @staticmethod
-    def _build_sparse_matrix(L):
-        """
-        build pytorch sparse tensor from scipy sparse matrix
-        reference: https://stackoverflow.com/questions/50665141
-        :return:
-        """
-        shape = L.shape
-        i = torch.LongTensor(np.vstack((L.row, L.col)).astype(int))
-        v = torch.FloatTensor(L.data)
-        return torch.sparse.FloatTensor(i, v, torch.Size(shape))
 
     def _gconv(self, inputs, state, output_size, bias_start=0.0):
         pass

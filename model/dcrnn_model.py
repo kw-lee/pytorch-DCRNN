@@ -4,32 +4,42 @@ from __future__ import print_function
 
 import torch
 import torch.nn as nn
+from lib import utils
 from model.dcrnn_cell import DCGRUCell
 import random
 from base import BaseModel
+import numpy as np 
 
 
 class DCRNNEncoder(BaseModel):
-    def __init__(self, input_dim, adj_mat, max_diffusion_step, hid_dim, num_nodes,
-                 num_rnn_layers, filter_type):
-        super(DCRNNEncoder, self).__init__()
-        self.hid_dim = hid_dim
+    def __init__(self, input_dim, max_diffusion_step, hid_dim, num_nodes,
+                 activation, num_rnn_layers, supports=None, adj_mat=None, filter_type=None):
+        super(DCRNNEncoder, self).__init__(supports=supports,
+                                           adj_mat=adj_mat,
+                                           filter_type=filter_type)
+        self._hid_dim = hid_dim
         self._num_rnn_layers = num_rnn_layers
+        self._activation = activation
 
         # encoding_cells = []
         encoding_cells = list()
+
         # the first layer has different input_dim
-        encoding_cells.append(DCGRUCell(input_dim=input_dim, num_units=hid_dim, 
-                                        adj_mat=adj_mat,
+        encoding_cells.append(DCGRUCell(input_dim=input_dim, 
+                                        num_units=self._hid_dim, 
                                         max_diffusion_step=max_diffusion_step,
-                                        num_nodes=num_nodes, filter_type=filter_type))
+                                        num_nodes=num_nodes, 
+                                        activation=self._activation,
+                                        supports=self._supports))
 
         # construct multi-layer rnn
         for _ in range(1, num_rnn_layers):
-            encoding_cells.append(DCGRUCell(input_dim=hid_dim, num_units=hid_dim, 
-                                            adj_mat=adj_mat,
+            encoding_cells.append(DCGRUCell(input_dim=self._hid_dim, 
+                                            num_units=self._hid_dim, 
                                             max_diffusion_step=max_diffusion_step,
-                                            num_nodes=num_nodes, filter_type=filter_type))
+                                            num_nodes=num_nodes, 
+                                            activation=self._activation,
+                                            supports=self._supports))
         self.encoding_cells = nn.ModuleList(encoding_cells)
 
 
@@ -61,31 +71,50 @@ class DCRNNEncoder(BaseModel):
         # init_states shape (num_layers, batch_size, num_nodes*num_units)
         return torch.stack(init_states, dim=0)
 
-
 class DCGRUDecoder(BaseModel):
-    def __init__(self, input_dim, adj_mat, max_diffusion_step, num_nodes,
-                 hid_dim, output_dim, num_rnn_layers, filter_type):
-        super(DCGRUDecoder, self).__init__()
-        self.hid_dim = hid_dim
+    def __init__(self, max_diffusion_step, input_dim, hid_dim, num_nodes,
+                 activation, output_dim, num_rnn_layers, dec_activation,
+                 supports=None, adj_mat=None, filter_type=None):
+        super(DCGRUDecoder, self).__init__(supports=supports,
+                                           adj_mat=adj_mat,
+                                           filter_type=filter_type)
+        
+        self._input_dim = input_dim
+        self._hid_dim = hid_dim
         self._num_nodes = num_nodes  # 207
         self._output_dim = output_dim  # should be 1
         self._num_rnn_layers = num_rnn_layers
+        self._activation = activation
+        self._dec_activation = dec_activation
 
-        cell = DCGRUCell(input_dim=hid_dim, num_units=hid_dim,
-                         adj_mat=adj_mat, max_diffusion_step=max_diffusion_step,
-                         num_nodes=num_nodes, filter_type=filter_type)
-        cell_with_projection = DCGRUCell(input_dim=hid_dim, num_units=hid_dim,
-                                         adj_mat=adj_mat, max_diffusion_step=max_diffusion_step,
-                                         num_nodes=num_nodes, num_proj=output_dim, filter_type=filter_type)
+        # cell = DCGRUCell(input_dim=self._hid_dim, num_units=self._hid_dim,
+        #                  max_diffusion_step=max_diffusion_step,
+        #                  num_nodes=num_nodes, 
+        #                  activation=self._activation,
+        #                  supports=self._supports)
+
+        # output
+        cell_with_projection = DCGRUCell(input_dim=self._hid_dim, num_units=self._hid_dim,
+                                         max_diffusion_step=max_diffusion_step,
+                                         num_nodes=num_nodes, 
+                                         activation=self._dec_activation,
+                                         num_proj=self._output_dim,
+                                         supports=self._supports)
 
         decoding_cells = list()
         # first layer of the decoder
-        decoding_cells.append(DCGRUCell(input_dim=input_dim, num_units=hid_dim,
-                                        adj_mat=adj_mat, max_diffusion_step=max_diffusion_step,
-                                        num_nodes=num_nodes, filter_type=filter_type))
+        decoding_cells.append(DCGRUCell(input_dim=self._input_dim, 
+                                        num_units=self._hid_dim,
+                                        max_diffusion_step=max_diffusion_step,
+                                        num_nodes=num_nodes, 
+                                        supports=self._supports))
         # construct multi-layer rnn
         for _ in range(1, num_rnn_layers - 1):
-            decoding_cells.append(cell)
+            decoding_cells.append(DCGRUCell(input_dim=self._hid_dim, num_units=self._hid_dim,
+                                            max_diffusion_step=max_diffusion_step,
+                                            num_nodes=num_nodes, 
+                                            activation=self._activation,
+                                            supports=self._supports))
         decoding_cells.append(cell_with_projection)
         self.decoding_cells = nn.ModuleList(decoding_cells)
 
@@ -141,9 +170,11 @@ class DCGRUDecoder(BaseModel):
 
 
 class DCRNNModel(BaseModel):
-    def __init__(self, adj_mat, enc_input_dim, dec_input_dim, max_diffusion_step, num_nodes,
-                 num_rnn_layers, rnn_units, seq_len, output_dim, filter_type):
-        super(DCRNNModel, self).__init__()
+    def __init__(self, enc_input_dim, dec_input_dim, max_diffusion_step, num_nodes,
+                 num_rnn_layers, rnn_units, seq_len, output_dim, adj_mat, filter_type,
+                 activation=torch.relu, dec_activation=nn.Identity):
+        super(DCRNNModel, self).__init__(supports=None, adj_mat=adj_mat, filter_type=filter_type)
+        
         # scaler for data normalization
         # self._scaler = scaler
 
@@ -154,19 +185,29 @@ class DCRNNModel(BaseModel):
         self._seq_len = seq_len  # should be 12
         # use_curriculum_learning = bool(model_kwargs.get('use_curriculum_learning', False))  # should be true
         self._output_dim = output_dim  # should be 1
+        self._activation = activation
+        self._dec_activation = dec_activation
 
         self.dummy_param = nn.Parameter(torch.empty(0))
 
-        self.encoder = DCRNNEncoder(input_dim=enc_input_dim, adj_mat=adj_mat,
+        self.encoder = DCRNNEncoder(input_dim=enc_input_dim,
                                     max_diffusion_step=max_diffusion_step,
-                                    hid_dim=rnn_units, num_nodes=num_nodes,
-                                    num_rnn_layers=num_rnn_layers, filter_type=filter_type)
-        self.decoder = DCGRUDecoder(input_dim=dec_input_dim,
-                                    adj_mat=adj_mat, max_diffusion_step=max_diffusion_step,
-                                    num_nodes=num_nodes, hid_dim=rnn_units,
+                                    hid_dim=rnn_units, 
+                                    num_nodes=num_nodes,
+                                    num_rnn_layers=num_rnn_layers,
+                                    activation=self._activation,
+                                    supports = self._supports)
+        self.decoder = DCGRUDecoder(input_dim=dec_input_dim, 
+                                    max_diffusion_step=max_diffusion_step,
+                                    num_nodes=num_nodes, 
+                                    hid_dim=rnn_units,
                                     output_dim=self._output_dim,
-                                    num_rnn_layers=num_rnn_layers, filter_type=filter_type)
-        assert self.encoder.hid_dim == self.decoder.hid_dim, \
+                                    num_rnn_layers=num_rnn_layers,
+                                    activation=self._activation,
+                                    dec_activation=self._dec_activation,
+                                    supports = self._supports)
+
+        assert self.encoder._hid_dim == self.decoder._hid_dim, \
             "Hidden dimensions of encoder and decoder must be equal!"
 
     def forward(self, source, target, teacher_forcing_ratio):
