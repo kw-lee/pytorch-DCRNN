@@ -71,14 +71,19 @@ class DiffusionGraphConv(BaseModel):
         # Reshape res back to 2D: (batch_size, num_node, state_dim) -> (batch_size, num_node * state_dim)
         return torch.reshape(x, [batch_size, self._num_nodes * output_size])
 
+    def to(self, *args, **kwargs):
+        """To be implemented"""
+        self = super().to(*args, **kwargs) 
+        self.weight = self.weight.to(*args, **kwargs) 
+        self.biases = self.biases.to(*args, **kwargs) 
+        return self
 
 class DCGRUCell(BaseModel):
     """
     Graph Convolution Gated Recurrent Unit Cell.
     """
     def __init__(self, input_dim, num_units, adj_mat, max_diffusion_step, num_nodes,
-                 num_proj=None, activation=torch.tanh, use_gc_for_ru=True, filter_type='laplacian',
-                 cuda=True):
+                 num_proj=None, activation=torch.tanh, use_gc_for_ru=True, filter_type='laplacian'):
         """
         :param num_units: the hidden dim of rnn
         :param adj_mat: the (weighted) adjacency matrix of the graph, in numpy ndarray form
@@ -107,18 +112,18 @@ class DCGRUCell(BaseModel):
         else:
             supports.append(utils.calculate_scaled_laplacian(adj_mat))
         for support in supports:
-            if cuda:
-                self._supports.append(self._build_sparse_matrix(support).cuda())  # to PyTorch sparse tensor
-            else:
-                self._supports.append(self._build_sparse_matrix(support))
+            self._supports.append(self._build_sparse_matrix(support))
         # supports = utils.calculate_scaled_laplacian(adj_mat, lambda_max=None)  # scipy coo matrix
         # self._supports = self._build_sparse_matrix(supports).cuda()  # to pytorch sparse tensor
+        self._supports = torch.Parameter(torch.stack(self._supports))
+        self._supports.requires_grad = False
 
         self.dconv_gate = DiffusionGraphConv(supports=self._supports, input_dim=input_dim,
                                              hid_dim=num_units, num_nodes=num_nodes,
                                              max_diffusion_step=max_diffusion_step,
                                              output_dim=num_units*2)
-        self.dconv_candidate = DiffusionGraphConv(supports=self._supports, input_dim=input_dim,
+        self.dconv_candidate = DiffusionGraphConv(supports=self._supports, 
+                                                  input_dim=input_dim,
                                                   hid_dim=num_units, num_nodes=num_nodes,
                                                   max_diffusion_step=max_diffusion_step,
                                                   output_dim=num_units)
@@ -183,6 +188,22 @@ class DCGRUCell(BaseModel):
     def _fc(self, inputs, state, output_size, bias_start=0.0):
         pass
 
-    def init_hidden(self, batch_size):
+    def init_hidden(self, batch_size, device=torch.device('cpu')):
         # state: (B, num_nodes * num_units)
-        return torch.zeros(batch_size, self._num_nodes * self._num_units)
+        return torch.zeros(batch_size, self._num_nodes * self._num_units, device=device)
+
+    def to(self, *args, **kwargs):
+        """To be implemented"""
+        self = super().to(*args, **kwargs) 
+        self.dconv_gate = self.dconv_gate.to(*args, **kwargs) 
+        self.dconv_candidate = self.dconv_candidate.to(*args, **kwargs) 
+
+        _supports = []
+        for _support in self._supports:
+            _supports.append(_support.to(*args, **kwargs))
+        self._supports = _supports    
+        
+        if self._num_proj is not None:
+            self.project = self.project.to(*args, **kwargs) 
+
+        return self
