@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import torch
 import torch.nn as nn
+from torch.nn.init import sparse_
 from lib import utils
 from model.dcrnn_cell import DCGRUCell
 import random
@@ -13,10 +14,11 @@ import numpy as np
 
 class DCRNNEncoder(BaseModel):
     def __init__(self, input_dim, max_diffusion_step, hid_dim, num_nodes,
-                 activation, num_rnn_layers, supports=None, adj_mat=None, filter_type=None):
-        super(DCRNNEncoder, self).__init__(supports=supports,
-                                           adj_mat=adj_mat,
-                                           filter_type=filter_type)
+                 activation, num_rnn_layers, 
+                 filter_type="random_walk",
+                 sparse_supports=True):
+        super(DCRNNEncoder, self).__init__(filter_type=filter_type,
+                                           sparse_supports=sparse_supports)
         self._hid_dim = hid_dim
         self._num_rnn_layers = num_rnn_layers
         self._activation = activation
@@ -30,7 +32,8 @@ class DCRNNEncoder(BaseModel):
                                         max_diffusion_step=max_diffusion_step,
                                         num_nodes=num_nodes, 
                                         activation=self._activation,
-                                        supports=self._supports))
+                                        filter_type=self._filter_type,
+                                        sparse_supports=self._sparse_supports))
 
         # construct multi-layer rnn
         for _ in range(1, num_rnn_layers):
@@ -39,11 +42,12 @@ class DCRNNEncoder(BaseModel):
                                             max_diffusion_step=max_diffusion_step,
                                             num_nodes=num_nodes, 
                                             activation=self._activation,
-                                            supports=self._supports))
+                                            filter_type=self._filter_type,
+                                            sparse_supports=self._sparse_supports))
         self.encoding_cells = nn.ModuleList(encoding_cells)
 
 
-    def forward(self, inputs, initial_hidden_state):
+    def forward(self, inputs, initial_hidden_state, supports):
         # inputs shape is (seq_length, batch, num_nodes, input_dim) (12, 64, 207, 2)
         # inputs to cell is (batch, num_nodes * input_dim)
         # init_hidden_state should be (num_layers, batch_size, num_nodes*num_units) (2, 64, 207*64)
@@ -56,7 +60,7 @@ class DCRNNEncoder(BaseModel):
             hidden_state = initial_hidden_state[i_layer]
             output_inner = []
             for t in range(seq_length):
-                _, hidden_state = self.encoding_cells[i_layer](current_inputs[t, ...], hidden_state)  # (50, 207*64)
+                _, hidden_state = self.encoding_cells[i_layer](current_inputs[t, ...], hidden_state, supports)  # (50, 207*64)
                 output_inner.append(hidden_state)
             output_hidden.append(hidden_state)
             current_inputs = torch.stack(output_inner, dim=0)
@@ -74,10 +78,10 @@ class DCRNNEncoder(BaseModel):
 class DCGRUDecoder(BaseModel):
     def __init__(self, max_diffusion_step, input_dim, hid_dim, num_nodes,
                  activation, output_dim, num_rnn_layers, dec_activation,
-                 supports=None, adj_mat=None, filter_type=None):
-        super(DCGRUDecoder, self).__init__(supports=supports,
-                                           adj_mat=adj_mat,
-                                           filter_type=filter_type)
+                 filter_type="random_walk",
+                 sparse_supports=True):
+        super(DCGRUDecoder, self).__init__(filter_type=filter_type,
+                                           sparse_supports=sparse_supports)
         
         self._input_dim = input_dim
         self._hid_dim = hid_dim
@@ -91,7 +95,7 @@ class DCGRUDecoder(BaseModel):
         #                  max_diffusion_step=max_diffusion_step,
         #                  num_nodes=num_nodes, 
         #                  activation=self._activation,
-        #                  supports=self._supports)
+        #                  supports=supports)
 
         # output
         cell_with_projection = DCGRUCell(input_dim=self._hid_dim, num_units=self._hid_dim,
@@ -99,7 +103,8 @@ class DCGRUDecoder(BaseModel):
                                          num_nodes=num_nodes, 
                                          activation=self._dec_activation,
                                          num_proj=self._output_dim,
-                                         supports=self._supports)
+                                         filter_type=self._filter_type,
+                                         sparse_supports=self._sparse_supports)
 
         decoding_cells = list()
         # first layer of the decoder
@@ -107,20 +112,22 @@ class DCGRUDecoder(BaseModel):
                                         num_units=self._hid_dim,
                                         max_diffusion_step=max_diffusion_step,
                                         num_nodes=num_nodes, 
-                                        supports=self._supports))
+                                        filter_type=self._filter_type,
+                                        sparse_supports=self._sparse_supports))
         # construct multi-layer rnn
         for _ in range(1, num_rnn_layers - 1):
             decoding_cells.append(DCGRUCell(input_dim=self._hid_dim, num_units=self._hid_dim,
                                             max_diffusion_step=max_diffusion_step,
                                             num_nodes=num_nodes, 
                                             activation=self._activation,
-                                            supports=self._supports))
+                                            filter_type=self._filter_type,
+                                            sparse_supports=self._sparse_supports))
         decoding_cells.append(cell_with_projection)
         self.decoding_cells = nn.ModuleList(decoding_cells)
 
         self.dummy_param = nn.Parameter(torch.empty(0))
 
-    def forward(self, inputs, initial_hidden_state, teacher_forcing_ratio=0.5):
+    def forward(self, inputs, initial_hidden_state, supports, teacher_forcing_ratio=0.5):
         """
         :param inputs: shape should be (seq_length+1, batch_size, num_nodes, input_dim)
         :param initial_hidden_state: the last hidden state of the encoder. (num_layers, batch, outdim)
@@ -157,7 +164,7 @@ class DCGRUDecoder(BaseModel):
             next_input_hidden_state = []
             for i_layer in range(0, self._num_rnn_layers):
                 hidden_state = initial_hidden_state[i_layer]
-                output, hidden_state = self.decoding_cells[i_layer](current_input, hidden_state)
+                output, hidden_state = self.decoding_cells[i_layer](current_input, hidden_state, supports)
                 current_input = output  # the input of present layer is the output of last layer
                 next_input_hidden_state.append(hidden_state)  # store each layer's hidden state
             initial_hidden_state = torch.stack(next_input_hidden_state, dim=0)
@@ -171,9 +178,9 @@ class DCGRUDecoder(BaseModel):
 
 class DCRNNModel(BaseModel):
     def __init__(self, enc_input_dim, dec_input_dim, max_diffusion_step, num_nodes,
-                 num_rnn_layers, rnn_units, seq_len, output_dim, adj_mat, filter_type,
-                 activation=torch.relu, dec_activation=nn.Identity):
-        super(DCRNNModel, self).__init__(supports=None, adj_mat=adj_mat, filter_type=filter_type)
+                 num_rnn_layers, rnn_units, seq_len, output_dim, filter_type,
+                 activation=torch.relu, dec_activation=None, sparse_supports=True):
+        super(DCRNNModel, self).__init__(filter_type=filter_type, sparse_supports=sparse_supports)
         
         # scaler for data normalization
         # self._scaler = scaler
@@ -196,7 +203,8 @@ class DCRNNModel(BaseModel):
                                     num_nodes=num_nodes,
                                     num_rnn_layers=num_rnn_layers,
                                     activation=self._activation,
-                                    supports = self._supports)
+                                    filter_type=self._filter_type,
+                                    sparse_supports=self._sparse_supports)
         self.decoder = DCGRUDecoder(input_dim=dec_input_dim, 
                                     max_diffusion_step=max_diffusion_step,
                                     num_nodes=num_nodes, 
@@ -205,12 +213,13 @@ class DCRNNModel(BaseModel):
                                     num_rnn_layers=num_rnn_layers,
                                     activation=self._activation,
                                     dec_activation=self._dec_activation,
-                                    supports = self._supports)
+                                    filter_type=self._filter_type,
+                                    sparse_supports=self._sparse_supports)
 
         assert self.encoder._hid_dim == self.decoder._hid_dim, \
             "Hidden dimensions of encoder and decoder must be equal!"
 
-    def forward(self, source, target, teacher_forcing_ratio):
+    def forward(self, source, target, supports, teacher_forcing_ratio):
         
         _batch_size = source.shape[0]
         device = self.dummy_param.device
@@ -228,9 +237,9 @@ class DCRNNModel(BaseModel):
         init_hidden_state = self.encoder.init_hidden(_batch_size, device=device)
 
         # last hidden state of the encoder is the context
-        context, _ = self.encoder(source, init_hidden_state)  # (num_layers, batch, outdim)
+        context, _ = self.encoder(source, init_hidden_state, supports)  # (num_layers, batch, outdim)
 
-        outputs = self.decoder(target, context, teacher_forcing_ratio=teacher_forcing_ratio)
+        outputs = self.decoder(target, context, supports, teacher_forcing_ratio=teacher_forcing_ratio)
         # the elements of the first time step of the outputs are all zeros.
         return outputs[1:, ...]  
         # (seq_length, batch_size, num_nodes, output_dim)  (12, 64, 207, 1)

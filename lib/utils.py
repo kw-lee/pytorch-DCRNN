@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import datetime
 from itertools import repeat
 from collections import OrderedDict
+import torch
 
 
 def ensure_dir(dirname):
@@ -228,3 +229,14 @@ def load_pickle(pickle_file):
         print('Unable to load data ', pickle_file, ':', e)
         raise
     return pickle_data
+
+def build_sparse_matrix(L):
+    """
+    build pytorch sparse tensor from scipy sparse matrix
+    reference: https://stackoverflow.com/questions/50665141
+    :return:
+    """
+    shape = L.shape
+    i = torch.LongTensor(np.vstack((L.row, L.col)).astype(int))
+    v = torch.FloatTensor(L.data)
+    return torch.sparse.FloatTensor(i, v, torch.Size(shape))
